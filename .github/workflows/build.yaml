@@ -1,10 +1,9 @@
 name: Build
 
 on:
-  push:
-    tags:
-      - '**'
-
+  issues:
+    types: [opened]
+    
 jobs:
   build:
     strategy:
