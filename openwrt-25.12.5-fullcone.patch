@@ -1,0 +1,818 @@
+diff --git a/package/libs/libnftnl/Makefile b/package/libs/libnftnl/Makefile
+index dd0de5c..3d0f4fd 100644
+--- a/package/libs/libnftnl/Makefile
++++ b/package/libs/libnftnl/Makefile
+@@ -10,7 +10,7 @@ include $(TOPDIR)/rules.mk
+ PKG_NAME:=libnftnl
+ PKG_CPE_ID:=cpe:/a:netfilter:libnftnl
+ PKG_VERSION:=1.3.1
+-PKG_RELEASE:=1
++PKG_RELEASE:=2
+ 
+ PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.xz
+ PKG_SOURCE_URL:=https://netfilter.org/projects/$(PKG_NAME)/files
+diff --git a/package/libs/libnftnl/patches/001-libnftnl-add-fullcone-expression-support.patch b/package/libs/libnftnl/patches/001-libnftnl-add-fullcone-expression-support.patch
+new file mode 100644
+index 0000000..f41d3fa
+--- /dev/null
++++ b/package/libs/libnftnl/patches/001-libnftnl-add-fullcone-expression-support.patch
+@@ -0,0 +1,261 @@
++From 6c39f04febd7cfdbd474233379416babcd0fc341 Mon Sep 17 00:00:00 2001
++From: Syrone Wong <wong.syrone@gmail.com>
++Date: Fri, 8 Apr 2022 23:52:11 +0800
++Subject: [PATCH] libnftnl: add fullcone expression support
++
++Signed-off-by: Syrone Wong <wong.syrone@gmail.com>
++---
++ include/libnftnl/expr.h             |   6 +
++ include/linux/netfilter/nf_tables.h |  16 +++
++ src/Makefile.am                     |   1 +
++ src/expr/fullcone.c                 | 167 ++++++++++++++++++++++++++++
++ src/expr_ops.c                      |   2 +
++ 5 files changed, 192 insertions(+)
++ create mode 100644 src/expr/fullcone.c
++
++--- a/include/libnftnl/expr.h
+++++ b/include/libnftnl/expr.h
++@@ -273,6 +273,13 @@ enum {
++ };
++ 
++ enum {
+++	NFTNL_EXPR_FULLCONE_FLAGS		= NFTNL_EXPR_BASE,
+++	NFTNL_EXPR_FULLCONE_REG_PROTO_MIN,
+++	NFTNL_EXPR_FULLCONE_REG_PROTO_MAX,
+++	__NFTNL_EXPR_FULLCONE_MAX
+++};
+++
+++enum {
++ 	NFTNL_EXPR_REDIR_REG_PROTO_MIN	= NFTNL_EXPR_BASE,
++ 	NFTNL_EXPR_REDIR_REG_PROTO_MAX,
++ 	NFTNL_EXPR_REDIR_FLAGS,
++--- a/include/linux/netfilter/nf_tables.h
+++++ b/include/linux/netfilter/nf_tables.h
++@@ -1510,6 +1510,22 @@ enum nft_masq_attributes {
++ #define NFTA_MASQ_MAX		(__NFTA_MASQ_MAX - 1)
++ 
++ /**
+++ * enum nft_fullcone_attributes - nf_tables fullcone expression attributes
+++ *
+++ * @NFTA_FULLCONE_FLAGS: NAT flags (see NF_NAT_RANGE_* in linux/netfilter/nf_nat.h) (NLA_U32)
+++ * @NFTA_FULLCONE_REG_PROTO_MIN: source register of proto range start (NLA_U32: nft_registers)
+++ * @NFTA_FULLCONE_REG_PROTO_MAX: source register of proto range end (NLA_U32: nft_registers)
+++ */
+++enum nft_fullcone_attributes {
+++	NFTA_FULLCONE_UNSPEC,
+++	NFTA_FULLCONE_FLAGS,
+++	NFTA_FULLCONE_REG_PROTO_MIN,
+++	NFTA_FULLCONE_REG_PROTO_MAX,
+++	__NFTA_FULLCONE_MAX
+++};
+++#define NFTA_FULLCONE_MAX		(__NFTA_FULLCONE_MAX - 1)
+++
+++/**
++  * enum nft_redir_attributes - nf_tables redirect expression netlink attributes
++  *
++  * @NFTA_REDIR_REG_PROTO_MIN: source register of proto range start (NLA_U32: nft_registers)
++--- a/src/Makefile.am
+++++ b/src/Makefile.am
++@@ -56,6 +56,7 @@ libnftnl_la_SOURCES = utils.c		\
++ 		      expr/target.c	\
++ 		      expr/tunnel.c	\
++ 		      expr/masq.c	\
+++		      expr/fullcone.c	\
++ 		      expr/redir.c	\
++ 		      expr/hash.c	\
++ 		      expr/socket.c	\
++--- /dev/null
+++++ b/src/expr/fullcone.c
++@@ -0,0 +1,174 @@
+++/*
+++ * (C) 2022-2025 wongsyrone
+++ *
+++ * This program is free software; you can redistribute it and/or modify
+++ * it under the terms of the GNU General Public License as published
+++ * by the Free Software Foundation; either version 2 of the License, or
+++ * (at your option) any later version.
+++ */
+++
+++#include <stdio.h>
+++#include <stdint.h>
+++#include <arpa/inet.h>
+++#include <errno.h>
+++#include <inttypes.h>
+++
+++#include <linux/netfilter/nf_tables.h>
+++
+++#include "internal.h"
+++#include <libmnl/libmnl.h>
+++#include <libnftnl/expr.h>
+++#include <libnftnl/rule.h>
+++
+++struct nftnl_expr_fullcone {
+++	uint32_t		flags;
+++	enum nft_registers	sreg_proto_min;
+++	enum nft_registers	sreg_proto_max;
+++};
+++
+++static int
+++nftnl_expr_fullcone_set(struct nftnl_expr *e, uint16_t type,
+++		       const void *data, uint32_t data_len)
+++{
+++	struct nftnl_expr_fullcone *fullcone = nftnl_expr_data(e);
+++
+++	switch (type) {
+++	case NFTNL_EXPR_FULLCONE_FLAGS:
+++		memcpy(&fullcone->flags, data, data_len);
+++		break;
+++	case NFTNL_EXPR_FULLCONE_REG_PROTO_MIN:
+++		memcpy(&fullcone->sreg_proto_min, data, data_len);
+++		break;
+++	case NFTNL_EXPR_FULLCONE_REG_PROTO_MAX:
+++		memcpy(&fullcone->sreg_proto_max, data, data_len);
+++		break;
+++	default:
+++		return -1;
+++	}
+++	return 0;
+++}
+++
+++static const void *
+++nftnl_expr_fullcone_get(const struct nftnl_expr *e, uint16_t type,
+++		       uint32_t *data_len)
+++{
+++	struct nftnl_expr_fullcone *fullcone = nftnl_expr_data(e);
+++
+++	switch (type) {
+++	case NFTNL_EXPR_FULLCONE_FLAGS:
+++		*data_len = sizeof(fullcone->flags);
+++		return &fullcone->flags;
+++	case NFTNL_EXPR_FULLCONE_REG_PROTO_MIN:
+++		*data_len = sizeof(fullcone->sreg_proto_min);
+++		return &fullcone->sreg_proto_min;
+++	case NFTNL_EXPR_FULLCONE_REG_PROTO_MAX:
+++		*data_len = sizeof(fullcone->sreg_proto_max);
+++		return &fullcone->sreg_proto_max;
+++	}
+++	return NULL;
+++}
+++
+++static int nftnl_expr_fullcone_cb(const struct nlattr *attr, void *data)
+++{
+++	const struct nlattr **tb = data;
+++	int type = mnl_attr_get_type(attr);
+++
+++	if (mnl_attr_type_valid(attr, NFTA_FULLCONE_MAX) < 0)
+++		return MNL_CB_OK;
+++
+++	switch (type) {
+++	case NFTA_FULLCONE_REG_PROTO_MIN:
+++	case NFTA_FULLCONE_REG_PROTO_MAX:
+++	case NFTA_FULLCONE_FLAGS:
+++		if (mnl_attr_validate(attr, MNL_TYPE_U32) < 0)
+++			abi_breakage();
+++		break;
+++	}
+++
+++	tb[type] = attr;
+++	return MNL_CB_OK;
+++}
+++
+++static void
+++nftnl_expr_fullcone_build(struct nlmsghdr *nlh, const struct nftnl_expr *e)
+++{
+++	struct nftnl_expr_fullcone *fullcone = nftnl_expr_data(e);
+++
+++	if (e->flags & (1 << NFTNL_EXPR_FULLCONE_FLAGS))
+++		mnl_attr_put_u32(nlh, NFTA_FULLCONE_FLAGS, htobe32(fullcone->flags));
+++	if (e->flags & (1 << NFTNL_EXPR_FULLCONE_REG_PROTO_MIN))
+++		mnl_attr_put_u32(nlh, NFTA_FULLCONE_REG_PROTO_MIN,
+++				 htobe32(fullcone->sreg_proto_min));
+++	if (e->flags & (1 << NFTNL_EXPR_FULLCONE_REG_PROTO_MAX))
+++		mnl_attr_put_u32(nlh, NFTA_FULLCONE_REG_PROTO_MAX,
+++				 htobe32(fullcone->sreg_proto_max));
+++}
+++
+++static int
+++nftnl_expr_fullcone_parse(struct nftnl_expr *e, struct nlattr *attr)
+++{
+++	struct nftnl_expr_fullcone *fullcone = nftnl_expr_data(e);
+++	struct nlattr *tb[NFTA_FULLCONE_MAX+1] = {};
+++
+++	if (mnl_attr_parse_nested(attr, nftnl_expr_fullcone_cb, tb) < 0)
+++		return -1;
+++
+++	if (tb[NFTA_FULLCONE_FLAGS]) {
+++		fullcone->flags = be32toh(mnl_attr_get_u32(tb[NFTA_FULLCONE_FLAGS]));
+++		e->flags |= (1 << NFTNL_EXPR_FULLCONE_FLAGS);
+++        }
+++	if (tb[NFTA_FULLCONE_REG_PROTO_MIN]) {
+++		fullcone->sreg_proto_min =
+++			be32toh(mnl_attr_get_u32(tb[NFTA_FULLCONE_REG_PROTO_MIN]));
+++		e->flags |= (1 << NFTNL_EXPR_FULLCONE_REG_PROTO_MIN);
+++	}
+++	if (tb[NFTA_FULLCONE_REG_PROTO_MAX]) {
+++		fullcone->sreg_proto_max =
+++			be32toh(mnl_attr_get_u32(tb[NFTA_FULLCONE_REG_PROTO_MAX]));
+++		e->flags |= (1 << NFTNL_EXPR_FULLCONE_REG_PROTO_MAX);
+++	}
+++
+++	return 0;
+++}
+++
+++static int nftnl_expr_fullcone_snprintf(char *buf, size_t remain,
+++				    uint32_t flags, const struct nftnl_expr *e)
+++{
+++	struct nftnl_expr_fullcone *fullcone = nftnl_expr_data(e);
+++	int offset = 0, ret = 0;
+++
+++	if (e->flags & (1 << NFTNL_EXPR_FULLCONE_REG_PROTO_MIN)) {
+++		ret = snprintf(buf + offset, remain, "proto_min reg %u ",
+++			       fullcone->sreg_proto_min);
+++		SNPRINTF_BUFFER_SIZE(ret, remain, offset);
+++	}
+++	if (e->flags & (1 << NFTNL_EXPR_FULLCONE_REG_PROTO_MAX)) {
+++		ret = snprintf(buf + offset, remain, "proto_max reg %u ",
+++			       fullcone->sreg_proto_max);
+++		SNPRINTF_BUFFER_SIZE(ret, remain, offset);
+++	}
+++	if (e->flags & (1 << NFTNL_EXPR_FULLCONE_FLAGS)) {
+++		ret = snprintf(buf + offset, remain, "flags 0x%x ", fullcone->flags);
+++		SNPRINTF_BUFFER_SIZE(ret, remain, offset);
+++	}
+++
+++	return offset;
+++}
+++
+++static struct attr_policy fullcone_attr_policy[__NFTNL_EXPR_FULLCONE_MAX] = {
+++	[NFTNL_EXPR_FULLCONE_FLAGS]         = { .maxlen = sizeof(uint32_t) },
+++	[NFTNL_EXPR_FULLCONE_REG_PROTO_MIN] = { .maxlen = sizeof(uint32_t) },
+++	[NFTNL_EXPR_FULLCONE_REG_PROTO_MAX] = { .maxlen = sizeof(uint32_t) },
+++};
+++
+++struct expr_ops expr_ops_fullcone = {
+++	.name		= "fullcone",
+++	.alloc_len	= sizeof(struct nftnl_expr_fullcone),
+++	.nftnl_max_attr	= __NFTNL_EXPR_FULLCONE_MAX - 1,
+++	.attr_policy	= fullcone_attr_policy,
+++	.set		= nftnl_expr_fullcone_set,
+++	.get		= nftnl_expr_fullcone_get,
+++	.parse		= nftnl_expr_fullcone_parse,
+++	.build		= nftnl_expr_fullcone_build,
+++	.output		= nftnl_expr_fullcone_snprintf,
+++};
++--- a/src/expr_ops.c
+++++ b/src/expr_ops.c
++@@ -20,6 +20,7 @@ extern struct expr_ops expr_ops_limit;
++ extern struct expr_ops expr_ops_log;
++ extern struct expr_ops expr_ops_lookup;
++ extern struct expr_ops expr_ops_masq;
+++extern struct expr_ops expr_ops_fullcone;
++ extern struct expr_ops expr_ops_match;
++ extern struct expr_ops expr_ops_meta;
++ extern struct expr_ops expr_ops_ng;
++@@ -65,6 +66,7 @@ static struct expr_ops *expr_ops[] = {
++ 	&expr_ops_log,
++ 	&expr_ops_lookup,
++ 	&expr_ops_masq,
+++	&expr_ops_fullcone,
++ 	&expr_ops_match,
++ 	&expr_ops_meta,
++ 	&expr_ops_ng,
+diff --git a/package/network/config/firewall4/Makefile b/package/network/config/firewall4/Makefile
+index 6ae34ea..330dd80 100644
+--- a/package/network/config/firewall4/Makefile
++++ b/package/network/config/firewall4/Makefile
+@@ -5,7 +5,7 @@
+ include $(TOPDIR)/rules.mk
+ 
+ PKG_NAME:=firewall4
+-PKG_RELEASE:=2
++PKG_RELEASE:=3
+ 
+ PKG_SOURCE_PROTO:=git
+ PKG_SOURCE_URL=$(PROJECT_GIT)/project/firewall4.git
+diff --git a/package/network/config/firewall4/patches/001-firewall4-add-support-for-fullcone-nat.patch b/package/network/config/firewall4/patches/001-firewall4-add-support-for-fullcone-nat.patch
+new file mode 100644
+index 0000000..8c84311
+--- /dev/null
++++ b/package/network/config/firewall4/patches/001-firewall4-add-support-for-fullcone-nat.patch
+@@ -0,0 +1,214 @@
++From aa3b56e289fba7425e649a608c333622ffd9c367 Mon Sep 17 00:00:00 2001
++From: Syrone Wong <wong.syrone@gmail.com>
++Date: Sat, 9 Apr 2022 13:24:19 +0800
++Subject: [PATCH] firewall4: add fullcone support
++
++fullcone is drop-in replacement of masq for non-udp traffic
++
++add runtime fullcone rule check, disable it globally if fullcone expr is
++invalid
++
++defaults.fullcone and defaults.fullcone6 are switches for IPv4 and IPv6
++respectively, most IPv6 traffic do NOT need this FullCone NAT functionality.
++
++Renew: ZiMing Mo <msylgj@immortalwrt.org>
++---
++ root/etc/config/firewall                      |  2 ++
++ root/usr/share/firewall4/templates/ruleset.uc | 16 ++++++++++++++--
++ .../firewall4/templates/zone-fullcone.uc      |  4 ++++
++ root/usr/share/ucode/fw4.uc                   | 69 ++++++++++++++++++-
++ 4 files changed, 89 insertions(+), 4 deletions(-)
++ create mode 100644 root/usr/share/firewall4/templates/zone-fullcone.uc
++
++--- a/root/etc/config/firewall
+++++ b/root/etc/config/firewall
++@@ -5,6 +5,8 @@ config defaults
++ 	option forward		REJECT
++ # Uncomment this line to disable ipv6 rules
++ #	option disable_ipv6	1
+++	option fullcone		1
+++	option fullcone6	0
++ 
++ config zone
++ 	option name		lan
++--- a/root/usr/share/firewall4/templates/ruleset.uc
+++++ b/root/usr/share/firewall4/templates/ruleset.uc
++@@ -327,6 +327,12 @@ table inet fw4 {
++ {%   for (let redirect in fw4.redirects(`dstnat_${zone.name}`)): %}
++ 		{%+ include("redirect.uc", { fw4, zone, redirect }) %}
++ {%   endfor %}
+++{%   if (zone.masq && fw4.default_option("fullcone")): %}
+++		{%+ include("zone-fullcone.uc", { fw4, zone, family: 4, direction: "dstnat" }) %}
+++{%   endif %}
+++{%   if (zone.masq6 && fw4.default_option("fullcone6")): %}
+++		{%+ include("zone-fullcone.uc", { fw4, zone, family: 6, direction: "dstnat" }) %}
+++{%   endif %}
++ {%   fw4.includes('chain-append', `dstnat_${zone.name}`) %}
++ 	}
++ 
++@@ -337,20 +343,26 @@ table inet fw4 {
++ {%   for (let redirect in fw4.redirects(`srcnat_${zone.name}`)): %}
++ 		{%+ include("redirect.uc", { fw4, zone, redirect }) %}
++ {%   endfor %}
++-{%   if (zone.masq): %}
+++{%   if (zone.masq && !fw4.default_option("fullcone")): %}
++ {%    for (let saddrs in zone.masq4_src_subnets): %}
++ {%     for (let daddrs in zone.masq4_dest_subnets): %}
++ 		{%+ include("zone-masq.uc", { fw4, zone, family: 4, saddrs, daddrs }) %}
++ {%     endfor %}
++ {%    endfor %}
++ {%   endif %}
++-{%   if (zone.masq6): %}
+++{%   if (zone.masq6 && !fw4.default_option("fullcone6")): %}
++ {%    for (let saddrs in zone.masq6_src_subnets): %}
++ {%     for (let daddrs in zone.masq6_dest_subnets): %}
++ 		{%+ include("zone-masq.uc", { fw4, zone, family: 6, saddrs, daddrs }) %}
++ {%     endfor %}
++ {%    endfor %}
++ {%   endif %}
+++{%   if (zone.masq && fw4.default_option("fullcone")): %}
+++		{%+ include("zone-fullcone.uc", { fw4, zone, family: 4, direction: "srcnat" }) %}
+++{%   endif %}
+++{%   if (zone.masq6 && fw4.default_option("fullcone6")): %}
+++		{%+ include("zone-fullcone.uc", { fw4, zone, family: 6, direction: "srcnat" }) %}
+++{%   endif %}
++ {%   fw4.includes('chain-append', `srcnat_${zone.name}`) %}
++ 	}
++ 
++--- /dev/null
+++++ b/root/usr/share/firewall4/templates/zone-fullcone.uc
++@@ -0,0 +1,4 @@
+++{# /usr/share/firewall4/templates/zone-fullcone.uc #}
+++		meta nfproto {{ fw4.nfproto(family) }} fullcone comment "!fw4: Handle {{
+++		zone.name
+++}} {{ fw4.nfproto(family, true) }} fullcone NAT {{ direction }} traffic"
++--- a/root/usr/share/ucode/fw4.uc
+++++ b/root/usr/share/ucode/fw4.uc
++@@ -1,3 +1,5 @@
+++// /usr/share/ucode/fw4.uc
+++
++ const fs = require("fs");
++ const uci = require("uci");
++ const ubus = require("ubus");
++@@ -489,6 +491,25 @@ function nft_try_hw_offload(devices) {
++ 	return (rc == 0);
++ }
++ 
+++function nft_try_fullcone() {
+++	let nft_test =
+++		'add table inet fw4-fullcone-test; ' +
+++		'add chain inet fw4-fullcone-test dstnat { ' +
+++			'type nat hook prerouting priority -100; policy accept; ' +
+++			'fullcone; ' +
+++		'}; ' +
+++		'add chain inet fw4-fullcone-test srcnat { ' +
+++			'type nat hook postrouting priority -100; policy accept; ' +
+++			'fullcone; ' +
+++		'}; ';
+++	let cmd = sprintf("/usr/sbin/nft -c '%s' 2>/dev/null", replace(nft_test, "'", "'\\''"));
+++	let ok = system(cmd) == 0;
+++	if (!ok) {
+++		warn("nft_try_fullcone: cmd "+ cmd + "\n");
+++	}
+++	return ok;
+++}
+++
++ 
++ return {
++ 	read_kernel_version: function() {
++@@ -855,6 +876,18 @@ return {
++ 			warn(`[!] ${msg}\n`);
++ 	},
++ 
+++	myinfo: function(fmt, ...args) {
+++		if (getenv("QUIET"))
+++			return;
+++
+++		let msg = sprintf(fmt, ...args);
+++
+++		if (getenv("TTY"))
+++			warn(`\033[32m${msg}\033[m\n`);
+++		else
+++			warn(`[I] ${msg}\n`);
+++	},
+++
++ 	get: function(sid, opt) {
++ 		return this.cursor.get("firewall", sid, opt);
++ 	},
++@@ -1036,6 +1069,21 @@ return {
++ 		}
++ 	},
++ 
+++	myinfo_section: function(s, msg) {
+++		if (s[".name"]) {
+++			if (s.name)
+++				this.myinfo("Section %s (%s) %s", this.section_id(s[".name"]), s.name, msg);
+++			else
+++				this.myinfo("Section %s %s", this.section_id(s[".name"]), msg);
+++		}
+++		else {
+++			if (s.name)
+++				this.myinfo("ubus %s (%s) %s", s.type || "rule", s.name, msg);
+++			else
+++				this.myinfo("ubus %s %s", s.type || "rule", msg);
+++		}
+++	},
+++
++ 	parse_policy: function(val) {
++ 		return this.parse_enum(val, [
++ 			"accept",
++@@ -1475,6 +1523,7 @@ return {
++ 			"dnat",
++ 			"snat",
++ 			"masquerade",
+++			"fullcone",
++ 			"accept",
++ 			"reject",
++ 			"drop"
++@@ -1946,6 +1995,8 @@ return {
++ 		}
++ 
++ 		let defs = this.parse_options(data, {
+++			fullcone: [ "bool", "0" ],
+++			fullcone6: [ "bool", "0" ],
++ 			input: [ "policy", "drop" ],
++ 			output: [ "policy", "drop" ],
++ 			forward: [ "policy", "drop" ],
++@@ -1980,6 +2031,11 @@ return {
++ 
++ 		delete defs.syn_flood;
++ 
+++		if (!nft_try_fullcone()) {
+++			delete defs.fullcone;
+++			warn("nft_try_fullcone failed, disable fullcone globally\n");
+++		}
+++
++ 		this.state.defaults = defs;
++ 	},
++ 
++@@ -2205,10 +2261,23 @@ return {
++ 		zone.related_subnets = related_subnets;
++ 		zone.related_physdevs = related_physdevs;
++ 
++-		if (zone.masq || zone.masq6)
+++		if (zone.masq) {
++ 			zone.dflags.snat = true;
+++			if (this.state.defaults.fullcone) {
+++				zone.dflags.dnat = true;
+++				this.myinfo_section(data, "IPv4 fullcone enabled for zone '" + zone.name + "'");
+++			}
+++		}
+++
+++		if (zone.masq6) {
+++			zone.dflags.snat = true;
+++			if (this.state.defaults.fullcone6) {
+++				zone.dflags.dnat = true;
+++				this.myinfo_section(data, "IPv6 fullcone enabled for zone '" + zone.name + "'");
+++			}
+++		}
++ 
++-		if ((zone.auto_helper && !(zone.masq || zone.masq6)) || length(zone.helper)) {
+++		if ((zone.auto_helper && !(zone.masq || zone.masq6 || this.state.defaults.fullcone || this.state.defaults.fullcone6)) || length(zone.helper)) {
++ 			zone.dflags.helper = true;
++ 
++ 			for (let helper in (length(zone.helper) ? zone.helper : this.state.helpers)) {
+diff --git a/package/network/utils/fullconenat-nft/Makefile b/package/network/utils/fullconenat-nft/Makefile
+new file mode 100644
+index 0000000..76746de
+--- /dev/null
++++ b/package/network/utils/fullconenat-nft/Makefile
+@@ -0,0 +1,50 @@
++# SPDX-License-Identifier: GPL-2.0-only
++# Copyright (c) 2018 Chion Tang <tech@chionlab.moe>
++#   Original xt_FULLCONENAT and related iptables extension author
++# Copyright (c) 2019-2022 GitHub/llccd Twitter/@gNodeB
++#   Added IPv6 support for xt_FULLCONENAT and ip6tables extension
++#   Ported to recent kernel versions
++# Copyright (c) 2022 Syrone Wong <wong.syrone@gmail.com>
++#   Massively rewrite the whole module, split the original code into library and nftables 'fullcone' expression module
++
++include $(TOPDIR)/rules.mk
++include $(INCLUDE_DIR)/kernel.mk
++
++PKG_NAME:=fullconenat-nft
++PKG_RELEASE:=3
++
++PKG_SOURCE_PROTO:=git
++PKG_SOURCE_URL:=https://github.com/fullcone-nat-nftables/nft-fullcone.git
++PKG_SOURCE_DATE:=2023-05-17
++PKG_SOURCE_VERSION:=07d93b626ce5ea885cd16f9ab07fac3213c355d9
++PKG_MIRROR_HASH:=84d54b5e6091148c31d4eddff2f8ead763c9ef318fdf35098a6f9cea9a29b7c8
++
++PKG_LICENSE:=GPL-2.0-only
++PKG_LICENSE_FILES:=LICENSE
++PKG_MAINTAINER:=Syrone Wong <wong.syrone@gmail.com>
++
++include $(INCLUDE_DIR)/package.mk
++
++define KernelPackage/nft-fullcone
++  SUBMENU:=Netfilter Extensions
++  DEPENDS:=+kmod-nft-nat
++  TITLE:=nftables fullcone expression support
++  FILES:= $(PKG_BUILD_DIR)/src/nft_fullcone.ko
++  KCONFIG:= \
++    CONFIG_NF_CONNTRACK_EVENTS=y \
++    CONFIG_NF_CONNTRACK_CHAIN_EVENTS=y
++  AUTOLOAD:=$(call AutoProbe,nft_fullcone)
++endef
++
++define KernelPackage/nft-fullcone/Description
++  Kernel module adds the fullcone expression that you can use
++  to perform NAT in the RFC3489-compatible full cone SNAT flavour.
++  Currently only UDP traffic is supported for full-cone NAT.
++  For other protos FULLCONENAT is equivalent to MASQUERADE.
++endef
++
++define Build/Compile
++	+$(KERNEL_MAKE) M="$(PKG_BUILD_DIR)/src" modules
++endef
++
++$(eval $(call KernelPackage,nft-fullcone))
+diff --git a/package/network/utils/fullconenat-nft/patches/010-fix-build-with-kernel-6.12.patch b/package/network/utils/fullconenat-nft/patches/010-fix-build-with-kernel-6.12.patch
+new file mode 100644
+index 0000000..1209678
+--- /dev/null
++++ b/package/network/utils/fullconenat-nft/patches/010-fix-build-with-kernel-6.12.patch
+@@ -0,0 +1,15 @@
++--- a/src/nft_ext_fullcone.c
+++++ b/src/nft_ext_fullcone.c
++@@ -121,7 +121,12 @@ static int exp_event_cb(unsigned int eve
++ }
++ #endif
++ 
+++#if ((LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 113)) && (LINUX_VERSION_CODE < KERNEL_VERSION(6, 7, 0))) || \
+++	(LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0))
+++static int nft_fullcone_validate(const struct nft_ctx *ctx, const struct nft_expr *expr)
+++#else
++ static int nft_fullcone_validate(const struct nft_ctx *ctx, const struct nft_expr *expr, const struct nft_data **data)
+++#endif
++ {
++ 	int err;
++ 
+diff --git a/package/network/utils/nftables/Makefile b/package/network/utils/nftables/Makefile
+index ff0d04b..fbcf77e 100644
+--- a/package/network/utils/nftables/Makefile
++++ b/package/network/utils/nftables/Makefile
+@@ -7,7 +7,7 @@ include $(TOPDIR)/rules.mk
+ 
+ PKG_NAME:=nftables
+ PKG_VERSION:=1.1.6
+-PKG_RELEASE:=2
++PKG_RELEASE:=3
+ 
+ PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.xz
+ PKG_SOURCE_URL:=https://netfilter.org/projects/$(PKG_NAME)/files
+diff --git a/package/network/utils/nftables/patches/002-nftables-add-fullcone-expression-support.patch b/package/network/utils/nftables/patches/002-nftables-add-fullcone-expression-support.patch
+new file mode 100644
+index 0000000..4a50da3
+--- /dev/null
++++ b/package/network/utils/nftables/patches/002-nftables-add-fullcone-expression-support.patch
+@@ -0,0 +1,209 @@
++From 58c89e8768711a959fdc6e953df3ea2254ff93c1 Mon Sep 17 00:00:00 2001
++From: Syrone Wong <wong.syrone@gmail.com>
++Date: Sat, 9 Apr 2022 00:38:51 +0800
++Subject: [PATCH] nftables: add fullcone expression support
++
++Signed-off-by: Syrone Wong <wong.syrone@gmail.com>
++---
++ include/linux/netfilter/nf_tables.h | 16 ++++++++++
++ include/statement.h                 |  1 +
++ src/netlink_delinearize.c           | 48 +++++++++++++++++++++++++++++
++ src/netlink_linearize.c             |  7 +++++
++ src/parser_bison.y                  | 28 +++++++++++++++--
++ src/scanner.l                       |  1 +
++ src/statement.c                     |  1 +
++ 7 files changed, 100 insertions(+), 2 deletions(-)
++
++--- a/include/linux/netfilter/nf_tables.h
+++++ b/include/linux/netfilter/nf_tables.h
++@@ -1500,6 +1500,22 @@ enum nft_masq_attributes {
++ #define NFTA_MASQ_MAX		(__NFTA_MASQ_MAX - 1)
++ 
++ /**
+++ * enum nft_fullcone_attributes - nf_tables fullcone expression attributes
+++ *
+++ * @NFTA_FULLCONE_FLAGS: NAT flags (see NF_NAT_RANGE_* in linux/netfilter/nf_nat.h) (NLA_U32)
+++ * @NFTA_FULLCONE_REG_PROTO_MIN: source register of proto range start (NLA_U32: nft_registers)
+++ * @NFTA_FULLCONE_REG_PROTO_MAX: source register of proto range end (NLA_U32: nft_registers)
+++ */
+++enum nft_fullcone_attributes {
+++	NFTA_FULLCONE_UNSPEC,
+++	NFTA_FULLCONE_FLAGS,
+++	NFTA_FULLCONE_REG_PROTO_MIN,
+++	NFTA_FULLCONE_REG_PROTO_MAX,
+++	__NFTA_FULLCONE_MAX
+++};
+++#define NFTA_FULLCONE_MAX		(__NFTA_FULLCONE_MAX - 1)
+++
+++/**
++  * enum nft_redir_attributes - nf_tables redirect expression netlink attributes
++  *
++  * @NFTA_REDIR_REG_PROTO_MIN: source register of proto range start (NLA_U32: nft_registers)
++--- a/include/statement.h
+++++ b/include/statement.h
++@@ -129,6 +129,7 @@ enum nft_nat_etypes {
++ 	__NFT_NAT_SNAT = NFT_NAT_SNAT,
++ 	__NFT_NAT_DNAT = NFT_NAT_DNAT,
++ 	NFT_NAT_MASQ,
+++	NFT_NAT_FULLCONE,
++ 	NFT_NAT_REDIR,
++ };
++ 
++--- a/src/netlink_delinearize.c
+++++ b/src/netlink_delinearize.c
++@@ -1521,6 +1521,53 @@ out_err:
++ 	stmt_free(stmt);
++ }
++ 
+++static void netlink_parse_fullcone(struct netlink_parse_ctx *ctx,
+++			       const struct location *loc,
+++			       const struct nftnl_expr *nle)
+++{
+++	enum nft_registers reg1, reg2;
+++	struct expr *proto;
+++	struct stmt *stmt;
+++	uint32_t flags = 0;
+++
+++	if (nftnl_expr_is_set(nle, NFTNL_EXPR_FULLCONE_FLAGS))
+++		flags = nftnl_expr_get_u32(nle, NFTNL_EXPR_FULLCONE_FLAGS);
+++
+++	stmt = nat_stmt_alloc(loc, NFT_NAT_FULLCONE);
+++	stmt->nat.flags = flags;
+++
+++	reg1 = netlink_parse_register(nle, NFTNL_EXPR_FULLCONE_REG_PROTO_MIN);
+++	if (reg1) {
+++		proto = netlink_get_register(ctx, loc, reg1);
+++		if (proto == NULL) {
+++			netlink_error(ctx, loc,
+++				      "fullcone statement has no proto expression");
+++			goto out_err;
+++		}
+++		expr_set_type(proto, &inet_service_type, BYTEORDER_BIG_ENDIAN);
+++		stmt->nat.proto = proto;
+++	}
+++
+++	reg2 = netlink_parse_register(nle, NFTNL_EXPR_FULLCONE_REG_PROTO_MAX);
+++	if (reg2 && reg2 != reg1) {
+++		proto = netlink_get_register(ctx, loc, reg2);
+++		if (proto == NULL) {
+++			netlink_error(ctx, loc,
+++				      "fullcone statement has no proto expression");
+++			goto out_err;
+++		}
+++		expr_set_type(proto, &inet_service_type, BYTEORDER_BIG_ENDIAN);
+++		if (stmt->nat.proto != NULL)
+++			proto = range_expr_alloc(loc, stmt->nat.proto, proto);
+++		stmt->nat.proto = proto;
+++	}
+++
+++	ctx->stmt = stmt;
+++	return;
+++out_err:
+++	stmt_free(stmt);
+++}
+++
++ static void netlink_parse_redir(struct netlink_parse_ctx *ctx,
++ 				const struct location *loc,
++ 				const struct nftnl_expr *nle)
++@@ -1952,6 +1999,7 @@ static const struct expr_handler netlink
++ 	{ .name = "tproxy",	.parse = netlink_parse_tproxy },
++ 	{ .name = "notrack",	.parse = netlink_parse_notrack },
++ 	{ .name = "masq",	.parse = netlink_parse_masq },
+++	{ .name = "fullcone",	.parse = netlink_parse_fullcone },
++ 	{ .name = "redir",	.parse = netlink_parse_redir },
++ 	{ .name = "dup",	.parse = netlink_parse_dup },
++ 	{ .name = "queue",	.parse = netlink_parse_queue },
++--- a/src/netlink_linearize.c
+++++ b/src/netlink_linearize.c
++@@ -1266,6 +1266,13 @@ static void netlink_gen_nat_stmt(struct
++ 		nftnl_reg_pmin = NFTNL_EXPR_MASQ_REG_PROTO_MIN;
++ 		nftnl_reg_pmax = NFTNL_EXPR_MASQ_REG_PROTO_MAX;
++ 		break;
+++	case NFT_NAT_FULLCONE:
+++		nle = alloc_nft_expr("fullcone");
+++
+++		nftnl_flag_attr = NFTNL_EXPR_FULLCONE_FLAGS;
+++		nftnl_reg_pmin = NFTNL_EXPR_FULLCONE_REG_PROTO_MIN;
+++		nftnl_reg_pmax = NFTNL_EXPR_FULLCONE_REG_PROTO_MAX;
+++		break;
++ 	case NFT_NAT_REDIR:
++ 		nle = alloc_nft_expr("redir");
++ 
++--- a/src/parser_bison.y
+++++ b/src/parser_bison.y
++@@ -668,6 +668,7 @@ int nft_lex(void *, void *, void *);
++ %token SNAT			"snat"
++ %token DNAT			"dnat"
++ %token MASQUERADE		"masquerade"
+++%token FULLCONE		"fullcone"
++ %token REDIRECT			"redirect"
++ %token RANDOM			"random"
++ %token FULLY_RANDOM		"fully-random"
++@@ -814,8 +815,8 @@ int nft_lex(void *, void *, void *);
++ %type <val>			limit_burst_pkts limit_burst_bytes limit_mode limit_bytes time_unit quota_mode
++ %type <stmt>			reject_stmt reject_stmt_alloc
++ %destructor { stmt_free($$); }	reject_stmt reject_stmt_alloc
++-%type <stmt>			nat_stmt nat_stmt_alloc masq_stmt masq_stmt_alloc redir_stmt redir_stmt_alloc
++-%destructor { stmt_free($$); }	nat_stmt nat_stmt_alloc masq_stmt masq_stmt_alloc redir_stmt redir_stmt_alloc
+++%type <stmt>			nat_stmt nat_stmt_alloc masq_stmt masq_stmt_alloc fullcone_stmt fullcone_stmt_alloc redir_stmt redir_stmt_alloc
+++%destructor { stmt_free($$); }	nat_stmt nat_stmt_alloc masq_stmt masq_stmt_alloc fullcone_stmt fullcone_stmt_alloc redir_stmt redir_stmt_alloc
++ %type <val>			nf_nat_flags nf_nat_flag offset_opt
++ %type <stmt>			tproxy_stmt
++ %destructor { stmt_free($$); }	tproxy_stmt
++@@ -3274,6 +3275,7 @@ stmt			:	verdict_stmt
++ 			|	queue_stmt
++ 			|	ct_stmt
++ 			|	masq_stmt	close_scope_nat
+++			|	fullcone_stmt	close_scope_nat
++ 			|	redir_stmt	close_scope_nat
++ 			|	dup_stmt	close_scope_dup
++ 			|	fwd_stmt	close_scope_fwd
++@@ -4105,6 +4107,28 @@ masq_stmt_args		:	TO 	COLON	stmt_expr
++ 			{
++ 				$<stmt>0->nat.proto = $3;
++ 			}
+++			|	TO 	COLON	stmt_expr	nf_nat_flags
+++			{
+++				$<stmt>0->nat.proto = $3;
+++				$<stmt>0->nat.flags = $4;
+++			}
+++			|	nf_nat_flags
+++			{
+++				$<stmt>0->nat.flags = $1;
+++			}
+++			;
+++
+++fullcone_stmt		:	fullcone_stmt_alloc		fullcone_stmt_args
+++			|	fullcone_stmt_alloc
+++			;
+++
+++fullcone_stmt_alloc		:	FULLCONE	{ $$ = nat_stmt_alloc(&@$, NFT_NAT_FULLCONE); }
+++			;
+++
+++fullcone_stmt_args		:	TO 	COLON	stmt_expr
+++			{
+++				$<stmt>0->nat.proto = $3;
+++			}
++ 			|	TO 	COLON	stmt_expr	nf_nat_flags
++ 			{
++ 				$<stmt>0->nat.proto = $3;
++--- a/src/scanner.l
+++++ b/src/scanner.l
++@@ -470,6 +470,7 @@ addrstring	({macaddr}|{ip4addr}|{ip6addr
++ "snat"			{ scanner_push_start_cond(yyscanner, SCANSTATE_STMT_NAT); return SNAT; }
++ "dnat"			{ scanner_push_start_cond(yyscanner, SCANSTATE_STMT_NAT); return DNAT; }
++ "masquerade"		{ scanner_push_start_cond(yyscanner, SCANSTATE_STMT_NAT); return MASQUERADE; }
+++"fullcone"		{ scanner_push_start_cond(yyscanner, SCANSTATE_STMT_NAT); return FULLCONE; }
++ "redirect"		{ scanner_push_start_cond(yyscanner, SCANSTATE_STMT_NAT); return REDIRECT; }
++ "random"		{ return RANDOM; }
++ <SCANSTATE_STMT_NAT>{
++--- a/src/statement.c
+++++ b/src/statement.c
++@@ -681,6 +681,7 @@ const char *nat_etype2str(enum nft_nat_e
++ 		[NFT_NAT_SNAT]	= "snat",
++ 		[NFT_NAT_DNAT]	= "dnat",
++ 		[NFT_NAT_MASQ]	= "masquerade",
+++		[NFT_NAT_FULLCONE] = "fullcone",
++ 		[NFT_NAT_REDIR]	= "redirect",
++ 	};
++ 
