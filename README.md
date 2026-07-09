@@ -34,6 +34,12 @@ Usage (kernel 6.12, GCC 14.3 based release):
   `CONFIG_ALL_KMODS`, and kmod-nf-conntrack-netlink selects it), so the module's
   conntrack event based mapping cleanup works against the unmodified official kernel
   config — vermagic and struct layouts both match.
+- The kmod's Makefile deliberately sets **no `KCONFIG`** (commented out, like the
+  22.03 patch did): vermagic is an md5 over the merged `.config.set`, computed
+  before oldconfig drops unknown symbols. With `CONFIG_ALL_KMODS` the package is
+  auto-selected, so any KCONFIG line it contributed (e.g. the non-upstream
+  `CONFIG_NF_CONNTRACK_CHAIN_EVENTS=y`) would change the hash and break the
+  vermagic match with the official kernel.
 - `PKG_RELEASE` of libnftnl / nftables / firewall4 is bumped by 1 so the patched
   rebuilds install as upgrades over the official packages.
 

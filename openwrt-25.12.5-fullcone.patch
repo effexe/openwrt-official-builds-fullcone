@@ -513,10 +513,10 @@ index 0000000..8c84311
 + 			for (let helper in (length(zone.helper) ? zone.helper : this.state.helpers)) {
 diff --git a/package/network/utils/fullconenat-nft/Makefile b/package/network/utils/fullconenat-nft/Makefile
 new file mode 100644
-index 0000000..76746de
+index 0000000..07a1ce4
 --- /dev/null
 +++ b/package/network/utils/fullconenat-nft/Makefile
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,54 @@
 +# SPDX-License-Identifier: GPL-2.0-only
 +# Copyright (c) 2018 Chion Tang <tech@chionlab.moe>
 +#   Original xt_FULLCONENAT and related iptables extension author
@@ -549,9 +549,13 @@ index 0000000..76746de
 +  DEPENDS:=+kmod-nft-nat
 +  TITLE:=nftables fullcone expression support
 +  FILES:= $(PKG_BUILD_DIR)/src/nft_fullcone.ko
-+  KCONFIG:= \
-+    CONFIG_NF_CONNTRACK_EVENTS=y \
-+    CONFIG_NF_CONNTRACK_CHAIN_EVENTS=y
++# KCONFIG must stay empty: any extra symbol lands in the kernel's
++# .config.set and changes vermagic away from the official kernel.
++# The official kernel already has CONFIG_NF_CONNTRACK_EVENTS=y
++# (kmod-nf-conntrack-netlink is selected via CONFIG_ALL_KMODS).
++#  KCONFIG:= \
++#    CONFIG_NF_CONNTRACK_EVENTS=y \
++#    CONFIG_NF_CONNTRACK_CHAIN_EVENTS=y
 +  AUTOLOAD:=$(call AutoProbe,nft_fullcone)
 +endef
 +
